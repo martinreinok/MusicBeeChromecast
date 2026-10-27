@@ -1,1042 +1,768 @@
 ﻿using System;
-using System.Windows.Forms;
-using System.IO;
-using System.Diagnostics;
-using GoogleCast;
-using Nito.AsyncEx.Synchronous;
-using GoogleCast.Channels;
-using GoogleCast.Models.Media;
-using System.Drawing;
-using System.Web;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Linq;
-using System.Xml;
-using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
-using System.Collections.ObjectModel;
-using NetFwTypeLib;
-using System.Security.Permissions;
-using System.Collections.Specialized;
-using System.Transactions;
-using System.Timers;
-using System.Collections;
-using System.ComponentModel;
-using Nito.AsyncEx;
-using System.Reflection;
-using System.Net.NetworkInformation;
-using FlacLibSharp;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+using Microsoft.VisualBasic;
 
 namespace MusicBeePlugin
 {
+    // MusicBee keeps playing (muted) and stays in charge; the Chromecast mirrors its track, play/pause, seek and volume.
     public partial class Plugin
     {
-        #region WebServer Variables
+        MusicBeeApiInterface mb;
+        PluginInfo about = new PluginInfo();
+        Dictionary<string, IPEndPoint> devices = new Dictionary<string, IPEndPoint>();
+        ContextMenuStrip popup;
+        Cast cast;
+        TvRemote remote;
+        readonly object remoteLock = new object();
+        X509Certificate2 certificate;
+        TcpListener http;
+        System.Threading.Timer timer;
+        string file;      // the web server only serves the current track
+        byte[] art;       // and its cover
+        int version;      // part of the URL, bumped per track
+        int lastPos, lastTick, ticks;
+        bool wasMuted, connecting;
+        static string logPath;
+        static readonly object logLock = new object();
 
-        private int? WebserverPort;
-        private WebServer mediaWebServer;
-        string mediaContentURL = null;
-
-        #endregion WebServer Variables
-
-        #region GoogleCast Chromecast Variables
-
-        private IMediaChannel mediaChannel = null;
-
-        #endregion GoogleCast Chromecast Variables
-
-        #region Musicbee API Variables
-
-        private MusicBeeApiInterface mbApiInterface;
-        private PluginInfo about = new PluginInfo();
-
-        #endregion Musicbee API Variables
-
-        #region Misc Variables
-
-        System.Timers.Timer fileDeletionTimer;
-        System.Timers.Timer progressTimer;
-        IterableStack<string> filenameStack;
-        SongHash songHash;
-        bool natural = false;
-
-        #endregion Misc Variables
-
-        #region Musicbee API Methods
+        // What the Chromecast said and asked for, to find out why something didn't play. Starts empty every time MusicBee starts.
+        internal static void Log(string message)
+        {
+            lock (logLock)
+                try { File.AppendAllText(logPath, DateTime.Now.ToString("HH:mm:ss.fff ") + message + Environment.NewLine); }
+                catch { }
+        }
 
         public PluginInfo Initialise(IntPtr apiInterfacePtr)
         {
-            mbApiInterface = new MusicBeeApiInterface();
-            mbApiInterface.Initialise(apiInterfacePtr);
+            mb = new MusicBeeApiInterface();
+            mb.Initialise(apiInterfacePtr);
+            logPath = Path.Combine(mb.Setting_GetPersistentStoragePath(), "Chromecast.log");
+            try { File.Delete(logPath); } catch { }
             about.PluginInfoVersion = PluginInfoVersion;
-            about.Name = "MusicBee Chromecast";
-            about.Description = "Adds casting functionality to MusicBee";
-            about.Author = "Troy Fernandes";
-            about.TargetApplication = "";   // current only applies to artwork, lyrics or instant messenger name that appears in the provider drop down selector or target Instant Messenger
+            about.Name = "Chromecast";
+            about.Description = "Play music on a Chromecast";
+            about.Author = "Martin Reinok";
+            about.TargetApplication = "";
             about.Type = PluginType.General;
-            about.VersionMajor = 2;  // your plugin version
-            about.VersionMinor = 0;
-            about.Revision = 1;
+            about.VersionMajor = 3;
             about.MinInterfaceVersion = MinInterfaceVersion;
             about.MinApiRevision = MinApiRevision;
-            about.ReceiveNotifications = (ReceiveNotificationFlags.PlayerEvents | ReceiveNotificationFlags.TagEvents);
-            about.ConfigurationPanelHeight = 25;   // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
+            about.ReceiveNotifications = ReceiveNotificationFlags.PlayerEvents;
 
-            mbApiInterface.MB_RegisterCommand("Chromecast", OnChromecastSelection);
-            
-
-            ToolStripMenuItem mainMenuItem = (ToolStripMenuItem)mbApiInterface.MB_AddMenuItem("mnuTools/MB Chromecast", null, null);
-
-            mainMenuItem.DropDown.Items.Add("Check Status", null, ShowStatusInMessagebox);
-            mainMenuItem.DropDown.Items.Add("Disconnect from Chromecast", null, (sender, e) => DisconnectFromChromecast(sender, e, false));
-            ReadSettings();
-
-            _ = EmptyDirectory();
-
-            fileDeletionTimer = new System.Timers.Timer();
-            fileDeletionTimer.Elapsed += new ElapsedEventHandler(OnTimedEvent);
-            fileDeletionTimer.Interval = 10000;
-
-            filenameStack = new IterableStack<string>();
-
-            songHash = new SongHash();
-
-            progressTimer = new System.Timers.Timer();
-            progressTimer.Elapsed += new ElapsedEventHandler(DoSomething);
-
+            var menu = (ToolStripMenuItem)mb.MB_AddMenuItem("mnuTools/Chromecast", null, null);
+            menu.DropDownItems.Add("Searching...");   // makes it a submenu
+            menu.DropDownOpening += (s, e) => Refresh(menu.DropDownItems);
+            mb.MB_RegisterCommand("Chromecast", (s, e) =>
+            {
+                if (popup == null) popup = new ContextMenuStrip();
+                Refresh(popup.Items);
+                popup.Show(Cursor.Position);
+            });
+            mb.MB_RegisterCommand("Chromecast: Volume Up", (s, e) => PressKey(TvRemote.VolumeUp));
+            mb.MB_RegisterCommand("Chromecast: Volume Down", (s, e) => PressKey(TvRemote.VolumeDown));
             return about;
         }
 
-        public bool Configure(IntPtr panelHandle)
-        {
-            // save any persistent settings in a sub-folder of this path
-            string dataPath = mbApiInterface.Setting_GetPersistentStoragePath();
-            // panelHandle will only be set if you set about.ConfigurationPanelHeight to a non-zero value
-            // keep in mind the panel width is scaled according to the font the user has selected
-            // if about.ConfigurationPanelHeight is set to 0, you can display your own popup window
-            if (panelHandle != IntPtr.Zero)
-            {
-                Panel configPanel = (Panel)Control.FromHandle(panelHandle);
-                Button prompt = new Button
-                {
-                    AutoSize = true,
-                    Location = new Point(0, 0),
-                    Text = "Settings"
-                };
-                prompt.Click += ShowSettings;
-                configPanel.Controls.AddRange(new Control[] { prompt });
-            }
-            return false;
-        }
-
-        // MusicBee is closing the plugin (plugin is being disabled by user or MusicBee is shutting down)
-        public void Close(PluginCloseReason reason)
-        {
-            StopChromecast();
-            StopWebserver();
-
-            EmptyDirectory().WaitWithoutException();
-
-            RevertSettings();
-
-
-        }
-
-        public void Uninstall()
-        {
-
-        }
+        public bool Configure(IntPtr panelHandle) { return false; }
+        public void SaveSettings() { }
+        public void Uninstall() { }
+        public void Close(PluginCloseReason reason) { Disconnect(); }
 
         public void ReceiveNotification(string sourceFileUrl, NotificationType type)
         {
-            if (mediaChannel != null) {
-
-                switch (type)
-                {
-                    
-                    case NotificationType.PlayStateChanged:
-
-                        //Play and pause the chromecast from the MB player
-                        if (mediaChannel.Status != null)
-                        {
-                            switch (mbApiInterface.Player_GetPlayState())
-                            {
-                                case PlayState.Paused:
-                                    mediaChannel.PauseAsync().WaitWithoutException();
-                                    break;
-
-                                case PlayState.Playing:
-                                    mediaChannel.PlayAsync().WaitWithoutException();
-                                    break;
-                            }
-
-                        }
-                        
-                        break;
-
-                    case NotificationType.NowPlayingListChanged:
-                        //natural = false;
-                        //progressTimer.Enabled = false;
-                        break;
-
-                    case NotificationType.PluginStartup:
-                        break;
-
-                    case NotificationType.VolumeLevelChanged:
-                        break;
-
-                    case NotificationType.TrackChanged:
-
-                        if (!PrerequisitesMet())
-                        {
-                            return;
-                        }
-
-                        fileDeletionTimer.Enabled = false;
-                        fileDeletionTimer.Enabled = true;
-
-                        CalculateHash(mbApiInterface.NowPlaying_GetFileUrl(), "current").WaitWithoutException();
-
-                        var info = CopySong(sourceFileUrl, songHash.Current).WaitAndUnwrapException();
-                        _ = LoadSong(info.Item1, info.Item2);
-
-                        break;
-                }
-
-
-
+            var c = cast;
+            if (c == null) return;
+            if (!mb.Player_GetMute()) mb.Player_SetMute(true);   // touching the volume unmutes MusicBee; the sound belongs on the TV
+            var state = mb.Player_GetPlayState();
+            switch (type)
+            {
+                case NotificationType.TrackChanged:
+                    Load(c);
+                    break;
+                case NotificationType.PlayStateChanged:
+                    if (state == PlayState.Playing || state == PlayState.Paused || state == PlayState.Stopped)
+                        c.Media(new { type = state == PlayState.Playing ? "PLAY" : "PAUSE", mediaSessionId = c.MediaSession });
+                    break;
+                case NotificationType.VolumeLevelChanged:
+                    c.SetVolume(mb.Player_GetVolume());
+                    break;
             }
         }
 
-        #endregion Musicbee API Methods
-
-        #region User Saved Settings
-
-        //Read the settings file
-        private void ReadSettings()
+        // Show the devices we know right away and update the list when discovery finishes.
+        void Refresh(ToolStripItemCollection items)
         {
-            var fullFilePath = @mbApiInterface.Setting_GetPersistentStoragePath() + @"\MB_Chromecast_Settings.xml";
-            if (File.Exists(fullFilePath))
-            {
-                XmlDocument doc = new XmlDocument();
-                doc.Load(fullFilePath);
-                var temp = doc.GetElementsByTagName("server_port")[0].InnerText;
-                if (!string.IsNullOrEmpty(temp))
-                {
-                    WebserverPort = Convert.ToInt16(temp);
-                }
-            }
-        }
-
-        //Fired when the user clicks Apply/Save in the preferences panel
-        public void SaveSettings()
-        {
-            ReadSettings();
-        }
-
-        //Show the Settings Form
-        private void ShowSettings(object sender, EventArgs e)
-        {
-            using (var settingsForm = new Settings(mbApiInterface.Setting_GetPersistentStoragePath()))
-            {
-                settingsForm.ShowDialog();
-            }
-        }
-
-        #endregion User Saved Settings
-
-        #region MB Chromecast UI Elements
-
-        #endregion MB Chromecast UI Elements
-
-        #region Core Methods
-
-        protected void OnChromecastSelection(object sender, EventArgs e)
-        {
-            //If the webserver started with no issues
-            try
-            {
-                //If there's already an active connection
-                if (mediaChannel != null)
-                {
-                    MessageBox.Show("There is already an active connection to a device. Please Disconnect then try again");
-                    return;
-                }
-
-
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("The webserver could not be started. Cancelling\n Error: " + ex.Message);
-                return;
-            }
-
-
-            using (var cs = new ChromecastPanel(
-                Color.FromArgb(mbApiInterface.Setting_GetSkinElementColour(SkinElement.SkinInputPanel, ElementState.ElementStateDefault, ElementComponent.ComponentBackground))))
+            var window = Control.FromHandle(mb.MB_GetWindowHandle());
+            Fill(items, true);
+            ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
                 {
-                    cs.StartPosition = FormStartPosition.CenterParent;
-                    cs.ShowDialog();
-
-
-                    mediaChannel = cs.ChromecastMediaChannel;
-                    if (mediaChannel == null)
-                    {
-                        RevertSettings();
-                        return;
-                    }
-    
-                    //Change some musicbee settings
-                    PauseIfPlaying();
-                    ChangeSettings();
-
-                    AttatchChromecastHandlers();
-
-                    //If the webserver started with an issue 
-                    if (StartWebserver() == -1)
-                    {
-                        return;
-                    }
-
+                    var found = Discover();
+                    window.BeginInvoke((Action)(() => { devices = found; Fill(items, false); }));
                 }
-                catch (NullReferenceException ex)
+                catch { }   // no network, or MusicBee is closing
+            });
+        }
+
+        void Fill(ToolStripItemCollection items, bool searching)
+        {
+            var old = items.Cast<ToolStripItem>().ToList();
+            foreach (var device in devices.OrderBy(d => d.Key))
+            {
+                var name = device.Key;
+                var endpoint = device.Value;
+                items.Add(new ToolStripMenuItem(name, null, (s, e) => Connect(name, endpoint)) { Checked = cast != null && cast.Name == name });
+            }
+            if (devices.Count == 0) items.Add(searching ? "Searching..." : "No Chromecasts found").Enabled = false;
+            if (cast != null)
+            {
+                items.Add(new ToolStripSeparator());
+                items.Add("Stop casting", null, (s, e) => Disconnect());
+            }
+            // Remove the old items last: emptying an open menu, even for a moment, makes WinForms move it to the top-left corner of the screen.
+            foreach (var item in old) items.Remove(item);
+        }
+
+        void Connect(string name, IPEndPoint endpoint)
+        {
+            if (connecting || cast != null && cast.Name == name) return;
+            Disconnect();
+            connecting = true;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
                 {
-                    MessageBox.Show(ex.Message);
-                }
-            }
-        }
-
-        //Synchronize changes made directly to the chromecast (i.e by some other remote) to the musicbee player
-        private void Synchronize_Reciever(object sender, EventArgs e)
-        {
-            
-            if (mediaChannel == null)
-            {
-                return;
-            }
-            var obj = mediaChannel.Status;
-            if (obj == null)
-            {
-                return;
-            }
-
-            var chromecastTime = obj.First().CurrentTime;
-            var playerState = obj.First().PlayerState;
-
-            //Reflect changes made in the songs timeline to the musicbee player
-            mbApiInterface.Player_SetPosition((int)(chromecastTime * 1000));
-
-            var musicbeePlayerState = mbApiInterface.Player_GetPlayState();
-
-            //Reflect the changes in the play state on the chromecast to the musicbee player
-            if (playerState == "PAUSED" && musicbeePlayerState == PlayState.Playing)
-            {
-                mbApiInterface.Player_PlayPause();
-            }
-            if (playerState == "PLAYING" && musicbeePlayerState == PlayState.Paused)
-            {
-                mbApiInterface.Player_PlayPause();
-            }
-        }
-
-        private void CCNext(object sender, EventArgs e)
-        {
-            mbApiInterface.Player_PlayNextTrack();
-        }
-
-        private void CCPrevious(object sender, EventArgs e)
-        {
-            mbApiInterface.Player_PlayPreviousTrack();
-        }
-
-        public void ChromecastDisconnect(object sender, EventArgs e)
-        {
-            Debug.WriteLine("Disconnected from chromecast");
-            mediaChannel = null;
-            StopIfPlaying();
-            StopWebserver();
-            RevertSettings();
-        }
-
-        public void DisconnectFromChromecast(object sender, EventArgs e, bool userCalled)
-        {
-            try
-            {
-                StopChromecast();
-            }
-            catch (NullReferenceException)
-            {
-            }
-
-        }
-
-        #endregion Core Methods
-
-        #region WebServer 
-
-        private int StartWebserver()
-        {
-            //If theres a web server already running, then theres no need to start a new one
-            if (mediaWebServer != null)
-            {
-                return 1;
-            }
-            try
-            {
-                //Create the web server
-                mediaWebServer = new WebServer(WebserverPort);
-                //Save the web server url
-                mediaContentURL = "http://" + GetLocalIP() + ":" + WebserverPort + "/";
-                return 0;
-            }
-            catch (Exception e)
-            {
-                MessageBox.Show("Error starting the webserver. \n " + e.Message);
-                return -1;
-            }
-
-        }
-
-        private void StopWebserver(object sender = null, EventArgs e = null)
-        {
-            try
-            {
-
-                if (mediaWebServer == null)
-                {
-                    return;
-                }
-                mediaWebServer.Stop();
-                mediaWebServer = null;
-            }
-            catch (NullReferenceException)
-            {
-                //Nothing to do since there was no web server initialized in the first place
-            }
-        }
-
-        #endregion WebServer
-
-        #region MB Settings
-
-        private void ChangeSettings()
-        {
-            //Settings need to be changed because they might change how the player interacts with chromecast.
-            //These settings get reverted back to their original settings after
-            mbApiInterface.Player_SetMute(true);
-
-        }
-
-        private void RevertSettings()
-        {
-            if (mbApiInterface.Player_GetMute())
-            {
-                mbApiInterface.Player_SetMute(false);
-            }
-        }
-
-        #endregion MB Settings
-
-        #region Helper Functions
-
-        public bool AttatchChromecastHandlers()
-        {
-            mediaChannel.StatusChanged += Synchronize_Reciever;
-            mediaChannel.Sender.Disconnected += ChromecastDisconnect;
-            mediaChannel.NextRequested += CCNext;
-            mediaChannel.PreviousRequested += CCPrevious;
-            return true;
-        }
-
-        public string GetLocalIP()
-        {
-            UnicastIPAddressInformation mostSuitableIp = null;
-
-            var networkInterfaces = NetworkInterface.GetAllNetworkInterfaces();
-
-            foreach (var network in networkInterfaces)
-            {
-                if (network.OperationalStatus != OperationalStatus.Up)
-                    continue;
-
-                var properties = network.GetIPProperties();
-
-                if (properties.GatewayAddresses.Count == 0)
-                    continue;
-
-                foreach (var address in properties.UnicastAddresses)
-                {
-                    if (address.Address.AddressFamily != AddressFamily.InterNetwork)
-                        continue;
-
-                    if (IPAddress.IsLoopback(address.Address))
-                        continue;
-
-                    if (!address.IsDnsEligible)
+                    Log("Connecting to " + name + " at " + endpoint);
+                    var c = new Cast(name, endpoint);
+                    c.StateChanged = OnCastStateChanged;
+                    c.Restarted = () => Load(c);
+                    c.Closed = () =>
                     {
-                        if (mostSuitableIp == null)
-                            mostSuitableIp = address;
-                        continue;
-                    }
-
-                    // The best IP is the IP got from DHCP server
-                    if (address.PrefixOrigin != PrefixOrigin.Dhcp)
-                    {
-                        if (mostSuitableIp == null || !mostSuitableIp.IsDnsEligible)
-                            mostSuitableIp = address;
-                        continue;
-                    }
-
-                    return address.Address.ToString();
-                }
-            }
-
-            return mostSuitableIp != null
-                ? mostSuitableIp.Address.ToString()
-                : "";
-        }
-
-
-        private bool PrerequisitesMet()
-        {
-            //The mediaChannel must not be null
-            //The server must be running
-            return mediaChannel != null && mediaWebServer != null;
-        }
-
-        public void UserClosingPlugin(object sender, EventArgs e)
-        {
-            Close(PluginCloseReason.UserDisabled);
-        }
-
-        public void PauseIfPlaying()
-        {
-            if (mbApiInterface.Player_GetPlayState() == PlayState.Playing)
-            {
-                mbApiInterface.Player_PlayPause();
-            }
-        }
-
-        public void StopIfPlaying()
-        {
-            if (mbApiInterface.Player_GetPlayState() == PlayState.Playing)
-            {
-                mbApiInterface.Player_Stop();
-            }
-        }
-
-        private void ShowStatusInMessagebox(object sender, EventArgs e)
-        {
-            StringBuilder status = new StringBuilder();
-            if (mediaChannel != null)
-            {
-                status.Append("Chromecast: Connected\n");
-            }
-            else
-            {
-                status.Append("Chromecast: Not Connected\n");
-            }
-
-
-            if (mediaWebServer != null)
-            {
-                status.Append("Server Status: Running @ " + mediaContentURL + "\n");
-            }
-            else
-            {
-                status.Append("Server Status: Not Running\n");
-            }
-            MessageBox.Show(status.ToString());
-        }
-
-        #endregion Helper Functions
-
-
-        public void DeleteFiles(string hashed)
-        {
-            try
-            {
-                System.IO.DirectoryInfo di = new DirectoryInfo(@System.IO.Path.GetTempPath() + @"\\MusicBeeChromecast");
-
-                foreach (FileInfo file in di.GetFiles())
-                {
-
-                    if (Path.GetFileNameWithoutExtension(file.Name) == hashed)
-                    {
-                        file.Delete();
-                    }
-                }
-
-            }
-            catch (System.IO.IOException)
-            {
-
-            }
-
-        }
-
-        public async Task<Tuple<string, string, string>> CopySong(string songFile, string hashed)
-        {
-
-            string songFileExt = Path.GetExtension(songFile);
-            File.Copy(songFile, @System.IO.Path.GetTempPath() + @"\\MusicBeeChromecast\" + hashed + songFileExt, true);
-
-            string imageFile = mbApiInterface.Library_GetArtworkUrl(songFile, 0);
-
-            string imageFileExt = ".jpg";
-
-            if (imageFile != null)
-            {
-                File.Copy(imageFile, @System.IO.Path.GetTempPath() + @"\\MusicBeeChromecast\" + hashed + imageFileExt, true);
-            }
-
-            return Tuple.Create(hashed, songFileExt, imageFileExt);
-        }
-
-
-        public async Task LoadSong(string hashed, string songFileExt)
-        {
-            string filetype = mbApiInterface.NowPlaying_GetFileProperty(FilePropertyType.Kind).Replace(" audio file", "");
-            string samplerate = mbApiInterface.NowPlaying_GetFileProperty(FilePropertyType.SampleRate);
-            string bitrate = mbApiInterface.NowPlaying_GetFileProperty(FilePropertyType.Bitrate);
-            string channels = mbApiInterface.NowPlaying_GetFileProperty(FilePropertyType.Channels);
-            string properties = "";
-            string nextSong = mbApiInterface.NowPlayingList_GetFileTag(mbApiInterface.NowPlayingList_GetNextIndex(1), MetaDataType.TrackTitle)
-                + " by " +mbApiInterface.NowPlayingList_GetFileTag(mbApiInterface.NowPlayingList_GetNextIndex(1), MetaDataType.Artist);
-            nextSong = nextSong == " by " || nextSong == null ? "End of List" : nextSong;
-
-            if (filetype == "FLAC")
-            {
-                using (FlacFile file = new FlacFile(mbApiInterface.NowPlaying_GetFileUrl()))
-                {
-                    properties = filetype + " " + file.StreamInfo.BitsPerSample.ToString() + " bit, " + samplerate + ", " + bitrate + ", " + channels;
-                }
-            }
-            else
-            {
-                properties = filetype + " " + samplerate + ", " + bitrate + ", " + channels;
-
-            }
-
-
-            string[] temp = null;
-            mbApiInterface.NowPlayingList_QueryFilesEx("", ref temp);
-            int size = temp.Count();
-
-            try
-            {
-                await mediaChannel.LoadAsync(
-                new MediaInformation()
-                {
-
-                    ContentId = HttpUtility.UrlPathEncode(mediaContentURL + hashed + songFileExt),
-                    StreamType = StreamType.Buffered,
-                    Duration = mbApiInterface.NowPlaying_GetDuration() / 1000,
-                    Metadata = new MusicTrackMediaMetadata
-                    {
-                        Artist = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist),
-                        Title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle),
-                        AlbumName = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album),
-                        Images = new[] {
-                        new GoogleCast.Models.Image
-                        {
-                            Url = mediaContentURL + hashed + ".jpg"
-                        }},
-                    },
-
-                    CustomData = new Dictionary<string, string>()
-                    {
-                       { "Properties", properties},
-                       { "Position", (mbApiInterface.NowPlayingList_GetCurrentIndex()+1).ToString()+ " / " + size.ToString()},
-                       { "Next", nextSong }
-
-                    }
-
-                }) ;
-
-                filenameStack.Push(hashed.ToString());
-                
-            }
-            catch (OperationCanceledException)
-            {
-                Debug.WriteLine("Requested to close");
-            }
-            catch (Exception e)
-            {
-                Debug.WriteLine(e.Message);
-            }
-        }
-
-        public async Task ProcessNextAndQueue(int currentPos)
-        {
-            var nextFileUrl = mbApiInterface.NowPlayingList_GetListFileUrl(currentPos+1);
-
-            await CalculateHash(nextFileUrl, "next");
-
-            var curr = songHash.Current;
-            var ne = songHash.Next;
-
-            string[] res = null;
-            mbApiInterface.Library_GetFileTags(nextFileUrl, new[] { MetaDataType.Artist, MetaDataType.TrackTitle, MetaDataType.Album }, ref res);
-            await QueueItem(songHash.Next,
-                Path.GetExtension(nextFileUrl),
-                0,
-                res[0],
-                res[1],
-                res[2]
-                );
-
-
-            filenameStack.Push(songHash.Next);
-
-            await CopySong(nextFileUrl, songHash.Next);
-            natural = true;
-        }
-
-        public string NextFileURL()
-        {
-            var nowPlayingIndex = mbApiInterface.NowPlayingList_GetCurrentIndex();
-
-            return mbApiInterface.NowPlayingList_GetListFileUrl(nowPlayingIndex + 1);
-
-        }
-
-
-        public async Task QueueItem(string hashedName, string songFileExt, int duration, string artist, string title, string album)
-        {
-
-            QueueItem[] i = new QueueItem[]
-            {
-                new QueueItem
-                {
-
-                    Media = new MediaInformation()
-                    {
-                        ContentId = HttpUtility.UrlPathEncode(mediaContentURL + hashedName + songFileExt),
-                        StreamType = StreamType.Buffered,
-                        Duration = duration / 1000,
-                        Metadata = new MusicTrackMediaMetadata
-                        {
-                            Artist = artist,
-                            Title = title,
-                            AlbumName = album,
-                            Images = new[] {
-                            new GoogleCast.Models.Image
-                            {
-                                Url = mediaContentURL + hashedName + ".jpg"
-                            }},
-                        }
-                    },
-                    Autoplay = true,
-                 }
-            };
-            await mediaChannel.QueueInsertAsync(i);
-
-        }
-
-
-        private void OnTimedEvent(object source, ElapsedEventArgs e)
-        {
-            DeleteOld().WaitWithoutException();
-            source.GetType().GetProperty("Enabled").SetValue(source, false, null);
-
-        }
-
-        public async Task CalculateHash(string songName, string which)
-        {
-            switch (which)
-            {
-                case "previous":
-                    songHash.Previous = Math.Abs(songName.GetHashCode()).ToString();
-                    return;
-
-                case "current":
-                    songHash.Current = Math.Abs(songName.GetHashCode()).ToString();
-                    return;
-
-                case "next":
-                    songHash.Next = Math.Abs(songName.GetHashCode()).ToString();
-                    return;
-            }
-
-
-        }
-
-        public async Task DeleteOld()
-        {
-            if (filenameStack.Count() > 1)
-            {
-                for (int i = 0; i < filenameStack.Count(); i++)
-                {
-                    var element = filenameStack.ElementAt(i);
-                    if (element != songHash.Current)
-                    {
-                        DeleteFiles(element.ToString());
-                        filenameStack.Remove(i);
-                    }
-                }
-            }
-        }
-
-        public async Task EmptyDirectory()
-        {
-            try
-            {
-                System.IO.DirectoryInfo di = new DirectoryInfo(@System.IO.Path.GetTempPath() + @"\\MusicBeeChromecast");
-
-                foreach (FileInfo file in di.GetFiles())
-                {
-                    file.Delete();
-                }
-
-            }
-            catch (System.IO.IOException)
-            {
-
-            }
-
-        }
-
-        private void GetPosition(object source, ElapsedEventArgs e)
-        {
-
-        }
-
-        private void DoSomething(object sender, EventArgs e)
-        {
-            var index = mbApiInterface.NowPlayingList_GetCurrentIndex();
-            ProcessNextAndQueue(index).WaitWithoutException();
-            progressTimer.Enabled = false;
-        }
-
-
-        public async Task LoadSongs(List<SongInfo> songs)
-        {
-            try
-            {
-                MediaInformation[] info = new MediaInformation[songs.Count];
-
-                for (int i = 0; i < info.Count(); i++)
-                {
-                    string[] res = null;
-                    mbApiInterface.Library_GetFileTags(songs[i].FileURL, new[] { MetaDataType.Artist, MetaDataType.TrackTitle, MetaDataType.Album}, ref res);
-                    info[i] = new MediaInformation
-                    {
-                        ContentId = HttpUtility.UrlPathEncode(mediaContentURL + songs[i].Hashed + songs[i].SongFileExt),
-                        StreamType = StreamType.Buffered,
-                        Duration = mbApiInterface.NowPlaying_GetDuration() / 1000,
-                        Metadata = new MusicTrackMediaMetadata
-                        {
-                            Artist = res[0],
-                            Title = res[1],
-                            AlbumName = res[2],
-                            Images = new[] {
-                            new GoogleCast.Models.Image
-                            {
-                                Url = mediaContentURL + songs[i].Hashed + ".jpg"
-                            }},
-
-                        }
+                        if (cast != c) return;   // we hung up ourselves
+                        if (mb.Player_GetPlayState() == PlayState.Playing) mb.Player_PlayPause();
+                        Disconnect();
                     };
-                    filenameStack.Push(songs[i].Hashed.ToString());
+                    if (http == null) StartServer();
+                    wasMuted = mb.Player_GetMute();
+                    mb.Player_SetMute(true);
+                    cast = c;
+                    Load(c);
+                    if (timer == null) timer = new System.Threading.Timer(Tick, null, 1000, 1000);
                 }
-
-
-                await mediaChannel.QueueLoadAsync(GoogleCast.Models.Media.RepeatMode.RepeatOff, info);
-            }
-            catch (OperationCanceledException)
-            {
-                Debug.WriteLine("Requested to close");
-            }
-            catch (Exception e)
-            {
-                Debug.WriteLine(e.Message);
-            }
-        }
-
-        public void StopChromecast()
-        {
-            if (mediaChannel != null && mediaChannel.Status != null)
-            {
-                mediaChannel.Sender.DisconnectAsync();
-            }
-            ChromecastDisconnect(null, null);
-
-        }
-    }
-
-
-    public static class ControlExtensions
-    {
-        public static void UIThread(this Control @this, Action code)
-        {
-            if (null != @this && (!@this.Disposing || !@this.IsDisposed))
-            {
-                if (@this.InvokeRequired)
+                catch (Exception e)
                 {
-                    @this.BeginInvoke(code);
+                    Log("Could not connect: " + e);
+                    MessageBox.Show("Could not connect to " + name + ":\n" + e.Message, "Chromecast");
+                }
+                finally { connecting = false; }
+            });
+        }
+
+        void Disconnect()
+        {
+            var r = Interlocked.Exchange(ref remote, null);
+            if (r != null) r.Close();
+            var c = Interlocked.Exchange(ref cast, null);
+            if (c == null) return;
+            Log("Disconnecting from " + c.Name);
+            c.Close();
+            mb.Player_SetMute(wasMuted);
+        }
+
+        // Paused or resumed from the TV remote or a phone.
+        void OnCastStateChanged(string playerState)
+        {
+            var state = mb.Player_GetPlayState();
+            if (playerState == "PAUSED" && state == PlayState.Playing || playerState == "PLAYING" && state == PlayState.Paused)
+                mb.Player_PlayPause();
+        }
+
+        void Load(Cast c)
+        {
+            string path = mb.NowPlaying_GetFileUrl(), artwork = mb.NowPlaying_GetArtwork();
+            if (string.IsNullOrEmpty(path)) return;
+            file = path;
+            art = string.IsNullOrEmpty(artwork) ? null : Convert.FromBase64String(artwork);
+            var url = "http://" + c.LocalIp + ":" + ((IPEndPoint)http.LocalEndpoint).Port + "/" + Interlocked.Increment(ref version) + "/";
+            var state = mb.Player_GetPlayState();
+            lastPos = mb.Player_GetPosition();
+            lastTick = Environment.TickCount;
+            c.Media(new
+            {
+                type = "LOAD",
+                autoplay = state != PlayState.Paused && state != PlayState.Stopped,
+                currentTime = lastPos / 1000.0,
+                media = new
+                {
+                    contentId = url + "audio",
+                    contentType = Mime(path),
+                    streamType = "BUFFERED",
+                    metadata = new
+                    {
+                        metadataType = 3,   // music track
+                        title = mb.NowPlaying_GetFileTag(MetaDataType.TrackTitle),
+                        artist = mb.NowPlaying_GetFileTag(MetaDataType.Artist),
+                        albumName = mb.NowPlaying_GetFileTag(MetaDataType.Album),
+                        images = art == null ? new object[0] : new object[] { new { url = url + "art" } }
+                    }
+                }
+            });
+        }
+
+        void Tick(object _)
+        {
+            var c = cast;
+            if (c == null) return;
+            try
+            {
+                if (++ticks % 5 == 0) c.Ping();
+                if (mb.NowPlaying_GetFileUrl() != file) return;   // track change in progress, Load will catch up
+                // MusicBee has no seek event, so watch for its position jumping.
+                int pos = mb.Player_GetPosition(), now = Environment.TickCount;
+                int expected = lastPos + (mb.Player_GetPlayState() == PlayState.Playing ? now - lastTick : 0);
+                if (Math.Abs(pos - expected) > 2000) c.Media(new { type = "SEEK", mediaSessionId = c.MediaSession, currentTime = pos / 1000.0 });
+                lastPos = pos;
+                lastTick = now;
+            }
+            catch { }   // an exception on a timer thread would take MusicBee down with it
+        }
+
+        // Volume keys go through the TV's remote control service, and the TV passes them on to the sound system over HDMI-CEC.
+        void PressKey(int key)
+        {
+            var c = cast;
+            if (c == null) return;
+            var window = Control.FromHandle(mb.MB_GetWindowHandle());
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                lock (remoteLock)
+                {
+                    try
+                    {
+                        if (remote == null || remote.IsClosed) remote = ConnectRemote(c, window);
+                        remote.Press(key);
+                    }
+                    catch (Exception e)
+                    {
+                        Log("Volume key failed: " + e);
+                        MessageBox.Show("Could not change the volume on " + c.Name + ":\n" + e.Message, "Chromecast");
+                    }
+                }
+            });
+        }
+
+        TvRemote ConnectRemote(Cast c, Control window)
+        {
+            if (certificate == null) certificate = Certificate();
+            try { return new TvRemote(c.Address, certificate); }
+            catch (Exception) { }   // not paired yet
+            TvRemote.Pair(c.Address, certificate, () => (string)window.Invoke((Func<string>)(() =>
+                Interaction.InputBox("Enter the code shown on " + c.Name + ":", "Pair with " + c.Name))));
+            return new TvRemote(c.Address, certificate);
+        }
+
+        // Who we are to the TV's remote control service; the TV remembers it after pairing.
+        X509Certificate2 Certificate()
+        {
+            var path = Path.Combine(mb.Setting_GetPersistentStoragePath(), "Chromecast.pfx");
+            if (!File.Exists(path))
+            {
+                var request = new CertificateRequest("CN=MusicBee", RSA.Create(2048), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                File.WriteAllBytes(path, request.CreateSelfSigned(DateTimeOffset.Now.AddDays(-1), DateTimeOffset.Now.AddYears(20)).Export(X509ContentType.Pfx));
+            }
+            return new X509Certificate2(path);
+        }
+
+        static string Mime(string path)
+        {
+            var ext = Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
+            return ext == "mp3" ? "audio/mpeg" : ext == "m4a" ? "audio/mp4" : ext == "ogg" || ext == "opus" ? "audio/ogg" : "audio/" + ext;
+        }
+
+        // Tiny HTTP server for the Chromecast to fetch /<version>/audio and /<version>/art from.
+        void StartServer()
+        {
+            http = new TcpListener(IPAddress.Any, 0);
+            http.Start();
+            new Thread(() =>
+            {
+                while (true)
+                {
+                    var client = http.AcceptTcpClient();
+                    new Thread(() => Serve(client)) { IsBackground = true }.Start();
+                }
+            }) { IsBackground = true }.Start();
+        }
+
+        void Serve(TcpClient client)
+        {
+            try
+            {
+                using (client)
+                {
+                    var stream = client.GetStream();
+                    var reader = new StreamReader(stream);
+                    var request = reader.ReadLine();
+                    var path = request.Split(' ')[1].Split('/');
+                    long from = 0, to = long.MaxValue;
+                    bool partial = false;
+                    for (string line; !string.IsNullOrEmpty(line = reader.ReadLine()); )
+                    {
+                        var range = Regex.Match(line, @"^Range:\s*bytes=(\d+)-(\d*)", RegexOptions.IgnoreCase);
+                        if (!range.Success) continue;
+                        partial = true;
+                        from = long.Parse(range.Groups[1].Value);
+                        if (range.Groups[2].Length > 0) to = long.Parse(range.Groups[2].Value);
+                    }
+
+                    string file = this.file;
+                    byte[] art = this.art;
+                    bool isArt = path.Length == 3 && path[2] == "art";
+                    if (path.Length != 3 || path[1] != version.ToString() || isArt && art == null)
+                    {
+                        Log("HTTP " + request + " -> 404");
+                        Write(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
+                    using (var data = isArt ? new MemoryStream(art) : (Stream)File.OpenRead(file))
+                    {
+                        to = Math.Min(to, data.Length - 1);
+                        Log("HTTP " + request + " -> bytes " + from + "-" + to + " of " + data.Length);
+                        Write(stream, (partial ? "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes " + from + "-" + to + "/" + data.Length : "HTTP/1.1 200 OK")
+                            + "\r\nContent-Type: " + (isArt ? (art[0] == 0x89 ? "image/png" : "image/jpeg") : Mime(file))
+                            + "\r\nContent-Length: " + (to - from + 1)
+                            + "\r\nAccept-Ranges: bytes\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+                        data.Position = from;
+                        var buffer = new byte[65536];
+                        for (long left = to - from + 1; left > 0; )
+                        {
+                            int n = data.Read(buffer, 0, (int)Math.Min(buffer.Length, left));
+                            if (n <= 0) break;
+                            stream.Write(buffer, 0, n);
+                            left -= n;
+                        }
+                    }
+                }
+            }
+            catch (Exception e) { Log("HTTP ended early: " + e.Message); }   // normal when the Chromecast seeks or skips
+        }
+
+        static void Write(Stream stream, string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes(text);
+            stream.Write(bytes, 0, bytes.Length);
+        }
+
+        // mDNS: ask for _googlecast._tcp.local and collect friendly name -> address from the answers.
+        static Dictionary<string, IPEndPoint> Discover()
+        {
+            var found = new Dictionary<string, IPEndPoint>();
+            var query = new List<byte> { 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };   // header with one question
+            foreach (var label in "_googlecast._tcp.local".Split('.'))
+            {
+                query.Add((byte)label.Length);
+                query.AddRange(Encoding.ASCII.GetBytes(label));
+            }
+            query.AddRange(new byte[] { 0, 0, 12, 0, 1 });                        // end of name, type PTR, class IN
+            using (var udp = new UdpClient(0))
+            {
+                // Ask on every network adapter, the Chromecast may not be behind the default one.
+                foreach (var local in Dns.GetHostAddresses(Dns.GetHostName()).Where(a => a.AddressFamily == AddressFamily.InterNetwork))
+                {
+                    try
+                    {
+                        udp.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, local.GetAddressBytes());
+                        udp.Send(query.ToArray(), query.Count, new IPEndPoint(IPAddress.Parse("224.0.0.251"), 5353));
+                    }
+                    catch (SocketException) { }
+                }
+                for (var end = DateTime.Now.AddSeconds(2); DateTime.Now < end; )
+                {
+                    udp.Client.ReceiveTimeout = Math.Max(1, (int)(end - DateTime.Now).TotalMilliseconds);
+                    var from = new IPEndPoint(IPAddress.Any, 0);
+                    byte[] answer;
+                    try { answer = udp.Receive(ref from); }
+                    catch (SocketException) { break; }
+                    try { ReadAnswer(answer, from.Address, found); }
+                    catch (IndexOutOfRangeException) { }
+                }
+            }
+            return found;
+        }
+
+        static void ReadAnswer(byte[] b, IPAddress ip, Dictionary<string, IPEndPoint> found)
+        {
+            var names = new Dictionary<string, string>();
+            var ports = new Dictionary<string, int>();
+            int i = 12;
+            for (int questions = b[4] << 8 | b[5]; questions > 0; questions--)
+            {
+                ReadName(b, ref i);
+                i += 4;
+            }
+            for (int records = (b[6] << 8 | b[7]) + (b[8] << 8 | b[9]) + (b[10] << 8 | b[11]); records > 0; records--)
+            {
+                var name = ReadName(b, ref i);
+                int type = b[i] << 8 | b[i + 1], start = i + 10, end = start + (b[i + 8] << 8 | b[i + 9]);
+                if (type == 33)   // SRV: priority, weight, port, target
+                    ports[name] = b[start + 4] << 8 | b[start + 5];
+                if (type == 16)   // TXT: length-prefixed key=value strings
+                    for (int j = start; j < end; j += b[j] + 1)
+                    {
+                        var entry = Encoding.UTF8.GetString(b, j + 1, b[j]);
+                        if (entry.StartsWith("fn=")) names[name] = entry.Substring(3);
+                    }
+                i = end;
+            }
+            foreach (var n in names) found[n.Value] = new IPEndPoint(ip, ports.ContainsKey(n.Key) ? ports[n.Key] : 8009);
+        }
+
+        static string ReadName(byte[] b, ref int i)
+        {
+            var labels = new List<string>();
+            int resume = -1;
+            for (int jumps = 0; b[i] != 0 && jumps < 64; )
+            {
+                if (b[i] >= 0xC0)   // pointer to a name earlier in the packet
+                {
+                    if (resume < 0) resume = i + 2;
+                    i = (b[i] & 0x3F) << 8 | b[i + 1];
+                    jumps++;
                 }
                 else
                 {
-                    code.Invoke();
+                    labels.Add(Encoding.UTF8.GetString(b, i + 1, b[i]));
+                    i += b[i] + 1;
                 }
             }
+            i = resume < 0 ? i + 1 : resume;
+            return string.Join(".", labels);
         }
     }
 
-    public class SongHash {
-        public string Previous { get; set; }
-        public string Current { get; set; }
-        public string Next { get; set; }
-
-        public void NewCurrent()
-        {
-            Current = Next;
-            Next = null;
-        }
-    }
-
-
-    public class IterableStack<T> : IEnumerable<string>
+    // Just enough of the Cast v2 protocol: JSON messages wrapped in protobuf, each prefixed with a 4-byte length.
+    class Cast : Connection
     {
-        private List<T> items = new List<T>();
+        const string ConnectionNamespace = "urn:x-cast:com.google.cast.tp.connection";
+        const string HeartbeatNamespace = "urn:x-cast:com.google.cast.tp.heartbeat";
+        const string ReceiverNamespace = "urn:x-cast:com.google.cast.receiver";
+        const string MediaNamespace = "urn:x-cast:com.google.cast.media";
+        const string AppId = "CC1AD845";   // Google's Default Media Receiver
+        static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
 
-        #region Enumerator
+        public readonly string Name;
+        public readonly IPAddress Address;
+        public readonly IPAddress LocalIp;   // our address as the Chromecast sees it
+        public string Transport, Session;
+        public int MediaSession;
+        public Action<string> StateChanged;
+        public Action Restarted;   // the TV restarted the player, so the track has to be loaded again
+        public Action Closed;
+        int requestId;
+        bool started;
+        System.Threading.Timer lost;
 
-        private IEnumerable<string> GetValues()
+        public Cast(string name, IPEndPoint endpoint) : base(endpoint, null)
         {
-            foreach (var s in items)
+            Name = name;
+            Address = endpoint.Address;
+            LocalIp = ((IPEndPoint)tcp.Client.LocalEndPoint).Address;
+            new Thread(ReadLoop) { IsBackground = true }.Start();
+            Send(ConnectionNamespace, "receiver-0", new { type = "CONNECT" });
+            Send(ReceiverNamespace, "receiver-0", new { type = "LAUNCH", appId = AppId });
+            for (int i = 0; i < 300 && Transport == null; i++) Thread.Sleep(100);   // waking a TV from standby takes a while
+            if (Transport != null) return;
+            tcp.Close();
+            throw new TimeoutException("The media player did not start.");
+        }
+
+        public void Media(object message)
+        {
+            var transport = Transport;
+            if (transport != null) Send(MediaNamespace, transport, message);
+        }
+
+        public void SetVolume(float level) { Send(ReceiverNamespace, "receiver-0", new { type = "SET_VOLUME", volume = new { level } }); }
+
+        public void Ping() { Send(HeartbeatNamespace, "receiver-0", new { type = "PING" }); }
+
+        public override void Close()
+        {
+            if (Session != null) Send(ReceiverNamespace, "receiver-0", new { type = "STOP", sessionId = Session });
+            base.Close();
+        }
+
+        void Send(string ns, string destination, object message)
+        {
+            var payload = "{\"requestId\":" + Interlocked.Increment(ref requestId) + "," + Json.Serialize(message).Substring(1);
+            if (ns != HeartbeatNamespace) Plugin.Log("> " + payload);
+            // CastMessage: protocol version, source, destination, namespace, payload type (string), payload
+            var body = Join(Field(1, 0), Field(2, "sender-0"), Field(3, destination), Field(4, ns), Field(5, 0), Field(6, payload));
+            Write(Join(BitConverter.GetBytes(IPAddress.HostToNetworkOrder(body.Length)), body));
+        }
+
+        void ReadLoop()
+        {
+            try
             {
-                yield return s.ToString();
+                while (true)
+                {
+                    var header = Read(4);
+                    var message = Parse(Read(header[0] << 24 | header[1] << 16 | header[2] << 8 | header[3]));
+                    string ns = Text(message, 4), payload = Text(message, 6) ?? "";
+                    if (ns != HeartbeatNamespace) Plugin.Log("< " + payload);
+                    Handle(Text(message, 2), ns, payload);
+                }
+            }
+            catch (Exception e) { Plugin.Log("Connection to " + Name + " closed: " + e.Message); }
+            tcp.Close();
+            if (Closed != null) Closed();
+        }
+
+        void Handle(string source, string ns, string payload)
+        {
+            if (ns == HeartbeatNamespace && payload.Contains("\"PING\""))
+                Send(HeartbeatNamespace, source, new { type = "PONG" });
+            else if (ns == ReceiverNamespace && payload.Contains("RECEIVER_STATUS"))
+            {
+                var transport = payload.Contains(AppId) ? Find(payload, "transportId") : null;
+                if (transport == Transport) return;
+                Transport = transport;
+                if (transport == null)
+                {
+                    // Stopped from a phone or the TV, unless the TV is only restarting the player.
+                    lost = new System.Threading.Timer(_ => { if (Transport == null) tcp.Close(); }, null, 10000, Timeout.Infinite);
+                    return;
+                }
+                // A new player session, the first one or a restart (e.g. while the TV wakes up).
+                Session = Find(payload, "sessionId");
+                Send(ConnectionNamespace, transport, new { type = "CONNECT" });
+                if (started && Restarted != null) Restarted();
+                started = true;
+            }
+            else if (ns == MediaNamespace)
+            {
+                var id = Find(payload, "mediaSessionId");
+                if (id != null) MediaSession = int.Parse(id);
+                var state = Find(payload, "playerState");
+                if (state != null && StateChanged != null) StateChanged(state);
             }
         }
 
-        #endregion Enumerator
-
-        #region IEnumerable implementation
-
-        public IEnumerator<string> GetEnumerator()
+        static string Find(string json, string key)
         {
-            return GetValues().GetEnumerator();
-        }
-
-        #endregion
-
-        #region IEnumerable implementation
-
-        IEnumerator IEnumerable.GetEnumerator()
-        {
-            return GetEnumerator();
-        }
-
-        #endregion
-
-
-        public void Push(T item)
-        {
-            items.Add(item);
-        }
-        public T Pop()
-        {
-            if (items.Count > 0)
-            {
-                T temp = items[items.Count - 1];
-                items.RemoveAt(items.Count - 1);
-                return temp;
-            }
-            else
-                return default(T);
-        }
-        public void Remove(int itemAtPosition)
-        {
-            items.RemoveAt(itemAtPosition);
-        }
-
-        public int Count()
-        {
-            return items.Count;
+            var match = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"?([^\",}]+)");
+            return match.Success ? match.Groups[1].Value : null;
         }
     }
 
-    public sealed class Listener : IDisposable
+    // Android TV Remote protocol v2, the one the Google TV phone app uses. Here it only presses the volume keys.
+    class TvRemote : Connection
     {
-        public event EventHandler CountChanged;
+        public const int VolumeUp = 24, VolumeDown = 25;
+        const int Features = 622;
+        public bool IsClosed;
+        bool ready;
 
-        public int Duration { get; set; }
-        public System.Timers.Timer Timer { get; set; }
-
-        public int Count { get; set; }
-
-        public Listener()
+        public TvRemote(IPAddress address, X509Certificate2 certificate) : base(new IPEndPoint(address, 6466), certificate)
         {
-            Timer = new System.Timers.Timer();
-            Timer.Elapsed += new ElapsedEventHandler(Increment);
-            Count = 1;
+            new Thread(ReadLoop) { IsBackground = true }.Start();
+            for (int i = 0; i < 50 && !ready && !IsClosed; i++) Thread.Sleep(100);
+            if (ready) return;
+            Close();
+            throw new IOException("The TV did not accept the remote control connection.");
         }
 
-        public void SetDuration(int Duration)
+        public void Press(int key) { WriteDelimited(Field(10, Field(1, key), Field(2, 3))); }   // key_inject, short press
+
+        void ReadLoop()
         {
-            Timer.Interval = Duration / 10;
-        }
-
-        public void Enable()
-        {
-            AddListener();
-            Timer.Enabled = false;
-            Timer.Enabled = true;
-        }
-
-        public void Disable()
-        {
-            Timer.Enabled = false;
-        }
-
-        public void AddListener()
-        {
-            Timer.Elapsed += Increment;
-        }
-
-        public void RemoveListener()
-        {
-            Timer.Elapsed -= Increment;
-        }
-
-
-        public void Reset()
-        {
-
-        }
-
-        private void Increment(object source, ElapsedEventArgs e)
-        {
-            Debug.WriteLine("Interval: " + Timer.Interval);
-            Debug.WriteLine("Count: " + Count);
-            Count++;
-            if (Count == 8)
+            try
             {
-                CountChanged?.Invoke(this, null);
-                RemoveListener();
-                Count = 1;
+                while (true)
+                {
+                    var message = ReadDelimited();
+                    if (message.ContainsKey(1))        // configure: introduce ourselves
+                        WriteDelimited(Field(1, Field(1, Features), Field(2, Field(1, "MusicBee"), Field(2, "MusicBee"), Field(3, 1), Field(4, "1"), Field(5, "musicbee"), Field(6, "1.0"))));
+                    else if (message.ContainsKey(2))   // set_active
+                    {
+                        WriteDelimited(Field(2, Field(1, Features)));
+                        ready = true;
+                    }
+                    else if (message.ContainsKey(8))   // ping
+                        WriteDelimited(Field(9, Field(1, Number(Parse((byte[])message[8]), 1))));
+                }
+            }
+            catch { }
+            IsClosed = true;
+            Close();
+        }
+
+        // One-time pairing on port 6467: the TV shows a code, the user types it in, and the TV trusts our certificate from then on.
+        public static void Pair(IPAddress address, X509Certificate2 certificate, Func<string> askForCode)
+        {
+            var pairing = new Connection(new IPEndPoint(address, 6467), certificate);
+            try
+            {
+                var sixHexDigits = Field(1, Field(1, 3), Field(2, 6));
+                Request(pairing, Field(10, Field(1, "atvremote"), Field(2, "MusicBee")));   // pairing request: service, client name
+                Request(pairing, Field(20, sixHexDigits, Field(3, 1)));                      // options: we enter the code
+                Request(pairing, Field(30, sixHexDigits, Field(2, 1)));                      // configuration: now the TV shows it
+                var code = (askForCode() ?? "").Trim();
+                if (!Regex.IsMatch(code, "^[0-9A-Fa-f]{6}$")) throw new Exception("Pairing cancelled.");
+                // The secret proves we saw the code: a hash of both public keys and the code's last four digits.
+                var client = certificate.GetRSAPublicKey().ExportParameters(false);
+                var server = new X509Certificate2(pairing.RemoteCertificate).GetRSAPublicKey().ExportParameters(false);
+                var digits = Enumerable.Range(1, 2).Select(i => Convert.ToByte(code.Substring(i * 2, 2), 16)).ToArray();
+                var secret = SHA256.Create().ComputeHash(Join(client.Modulus, client.Exponent, server.Modulus, server.Exponent, digits));
+                if (secret[0] != Convert.ToByte(code.Substring(0, 2), 16)) throw new Exception("That is not the code shown on the TV.");
+                Request(pairing, Field(40, Field(1, secret)));
+            }
+            finally { pairing.Close(); }
+        }
+
+        static void Request(Connection pairing, byte[] content)
+        {
+            pairing.WriteDelimited(Join(Field(1, 2), Field(2, 200), content));   // protocol version 2, status OK
+            if (Number(pairing.ReadDelimited(), 2) != 200) throw new Exception("The TV refused to pair.");
+        }
+    }
+
+    // A TLS connection carrying protobuf messages, the transport of both protocols above.
+    class Connection
+    {
+        protected readonly TcpClient tcp = new TcpClient();
+        readonly SslStream ssl;
+
+        public Connection(IPEndPoint endpoint, X509Certificate2 certificate)
+        {
+            tcp.Connect(endpoint);
+            try
+            {
+                // Both ends use self-signed certificates.
+                ssl = new SslStream(tcp.GetStream(), false, (a, b, c, d) => true, (a, b, c, d, e) => certificate);
+                var certificates = certificate == null ? null : new X509CertificateCollection(new X509Certificate[] { certificate });
+                ssl.AuthenticateAsClient(endpoint.Address.ToString(), certificates, SslProtocols.Tls12, false);
+            }
+            catch
+            {
+                tcp.Close();
+                throw;
             }
         }
 
-        public void Dispose()
-        {
-            CountChanged = null;
-            Timer = null;
+        public X509Certificate RemoteCertificate { get { return ssl.RemoteCertificate; } }
 
+        public virtual void Close() { tcp.Close(); }
+
+        public void Write(byte[] bytes)
+        {
+            try { lock (ssl) ssl.Write(bytes, 0, bytes.Length); }
+            catch { tcp.Close(); }
+        }
+
+        public byte[] Read(int count)
+        {
+            var bytes = new byte[count];
+            for (int read = 0; read < count; )
+            {
+                int n = ssl.Read(bytes, read, count - read);
+                if (n <= 0) throw new IOException("Connection closed.");
+                read += n;
+            }
+            return bytes;
+        }
+
+        // Messages prefixed with their length as a varint.
+        public void WriteDelimited(byte[] message) { Write(Join(Varint(message.Length), message)); }
+
+        public Dictionary<int, object> ReadDelimited()
+        {
+            int length = 0;
+            for (int shift = 0; ; shift += 7)
+            {
+                var b = Read(1)[0];
+                length |= (b & 0x7F) << shift;
+                if (b < 0x80) return Parse(Read(length));
+            }
+        }
+
+        public static byte[] Join(params byte[][] parts) { return parts.SelectMany(p => p).ToArray(); }
+
+        public static byte[] Varint(long value)
+        {
+            var bytes = new List<byte>();
+            for (; value >= 0x80; value >>= 7) bytes.Add((byte)(value | 0x80));
+            bytes.Add((byte)value);
+            return bytes.ToArray();
+        }
+
+        public static byte[] Field(int number, long value) { return Join(Varint(number << 3), Varint(value)); }
+
+        public static byte[] Field(int number, string value) { return Field(number, Encoding.UTF8.GetBytes(value)); }
+
+        public static byte[] Field(int number, params byte[][] content)
+        {
+            var bytes = Join(content);
+            return Join(Varint(number << 3 | 2), Varint(bytes.Length), bytes);
+        }
+
+        // Field number -> value: a number, or the bytes of a string or nested message.
+        public static Dictionary<int, object> Parse(byte[] message)
+        {
+            var fields = new Dictionary<int, object>();
+            for (int i = 0; i < message.Length; )
+            {
+                long tag = ReadVarint(message, ref i);
+                if ((tag & 7) == 0)
+                    fields[(int)(tag >> 3)] = ReadVarint(message, ref i);
+                else if ((tag & 7) == 2)
+                {
+                    int length = (int)ReadVarint(message, ref i);
+                    fields[(int)(tag >> 3)] = message.Skip(i).Take(length).ToArray();
+                    i += length;
+                }
+                else
+                    i += (tag & 7) == 1 ? 8 : 4;   // fixed-size numbers, not used by either protocol
+            }
+            return fields;
+        }
+
+        public static long Number(Dictionary<int, object> message, int field)
+        {
+            object value;
+            return message.TryGetValue(field, out value) && value is long ? (long)value : 0;
+        }
+
+        public static string Text(Dictionary<int, object> message, int field)
+        {
+            object value;
+            return message.TryGetValue(field, out value) && value is byte[] ? Encoding.UTF8.GetString((byte[])value) : null;
+        }
+
+        static long ReadVarint(byte[] bytes, ref int i)
+        {
+            long value = 0;
+            for (int shift = 0; ; shift += 7)
+            {
+                value |= (long)(bytes[i] & 0x7F) << shift;
+                if (bytes[i++] < 0x80) return value;
+            }
         }
     }
-
-    public class SongInfo 
-    { 
-        public string Hashed { get; set; }
-        public string SongFileExt { get; set; }
-        public string FileURL { get; set; }
-    }
-
 }
