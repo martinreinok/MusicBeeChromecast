@@ -1,48 +1,37 @@
-# MusicBeeChromecast
-Adds Cast functionality to MusicBee
+# MusicBee Chromecast
 
-**Disclaimer:** I originally didn't intend to release this plugin as I won't have more time to work on it other than bare functionality, however maybe someone else will find this useful so here I am. As a result, this plugin is here "AS-IS". That being said, the plugin is fairly easy to follow along, so feel free to fork this repo and make changes if you like. Just make sure you credit the people who made the packages, as well as me.
+Play MusicBee's music on a Chromecast, a speaker group, or a TV with Chromecast built-in. It's one small C# file and needs nothing else installed.
 
-![UI](https://raw.githubusercontent.com/TroyFernandes/MusicBeeChromecast/master/Images/UI.jpg)
+MusicBee stays in charge. While casting, it plays muted and the Chromecast follows its track changes, play/pause, seeking and volume. The TV shows the title, artist, album and cover art. Pausing from the TV remote or a phone pauses MusicBee too.
 
-# Features
-1. Standard controls from the Chromecast such as play, pause, next, previous
-2. Display music information such as artist, album, album art, queue status, file info, and next songs on chromecast devices with an attached display.
-3. Use the Google voice assistant to control media (Next, Previous, Seek)
-4. Allows casting to speaker groups for multi-room audio
+![A TV playing a song from MusicBee, showing the album cover, title and progress](images/tv.jpeg)
 
-# Installation
+## Install
 
-1. Go to releases and download the zipped file (MB_Chromecast.zip)
-2. Extract the zip to somewhere temporary (i.e Desktop)
-3. Copy the two .dll files found in Plugins in the extracted folder to your musicbee plugins folder
-4. Open a command prompt window and navigate to the MBCCRules folder in the extracted zip
-5. Run the .exe from the command prompt passing in the port you wish to use eg. ``MBCCRules.exe 8080``
+1. Run `build.cmd` (it uses the C# compiler that comes with Windows), or download `mb_Chromecast.dll` from Releases.
+2. Copy `mb_Chromecast.dll` into `C:\Program Files (x86)\MusicBee\Plugins` and restart MusicBee.
+3. Optional: to get a toolbar button, right-click the toolbar, choose **Configure Toolbar**, add a button and set its command to **Chromecast**.
 
-The ``MBCCRules.exe`` requires admin privileges, creates an inbound firewall rule for you local network and runs the following command: ``netsh http add urlacl url=http://*:[PORT]/ user=Everyone`` which allows the chromecast to connect to your PC by it's IP
+## Use
 
-# Setup
-**PLEASE READ CAREFULLY**
+Click the toolbar button, or open **Tools → Chromecast**. Pick a device to start casting, or click **Stop casting** to stop.
 
-1. Go to Edit -> Edit Preferences -> Plugins -> Click the "Settings" button under Musicbee Chromecast
-2. Enter a web server port. Use the same port you used for the ``MBCCRules.exe`` NOTE: you must choose a port between 1025-65535 (I recommend 8080)
-4. Click save, and restart musicbee
-5. Right-click the toolbar (or on the "Arrange Panels") icon and click "Configure Toolbar"
-6. Add a new Toolbar button with an icon of your choosing, or simply type in "Chromecast" for example. Under the "Command" dropdown, choose "Chromecast". Then click update.
+![The Tools → Chromecast menu in MusicBee, listing a TV and Stop casting](images/musicbee-plugin.png)
 
-# How to Use
-The plugin will find all available devices/speaker groups you've created. To use the plugin, click the Toolbar Icon/text you created in the previous steps, a window with all the available devices will pop up. Simply choose one you want to connect to and it should connect successfully. You can go to Tools -> MB Chromecast -> Check status, to see if everything is running. 
+The first time you cast, Windows asks whether MusicBee may use the network. Allow it on private networks, because the Chromecast streams the files from your PC.
 
-# Troubleshooting
+### Volume on TVs with a sound system
 
-1. You can go to Tools -> MB Chromecast -> Check status to check the status of the web server and the chromecast connection
-2. If you hear the connection sound, but no music is playing, you most likely have an issue with your port forwarding on the webserver. A good tip to try is after connecting to a chromecast, go on your phone and enter in a browser the 
-``<machines IP>:<Port#>`` e.g ``192.168.1.27:8080``. (You can also find this address under Check Status) If you're able to see the files, then the chromecast will be able to as well
-3. If you get an error when trying to save settings. ``Navigate to C:\Users\<YourName>\Appdata\Roaming\MusicBee\MB_Chromecast_Settings.xml`` and delete the file.
-4. If you get `The server factory could not be located for the given input: Microsoft.Owin.Host.HttpListener`, try moving the `Microsoft.Owin.Host.HttpListener.dll` to the same folder where the ``MusicBee.exe`` is (i.e up one folder).
+Many TVs report a fixed volume to Chromecast, for example when the sound goes to a soundbar or receiver over HDMI-CEC. MusicBee's volume slider can't change those. On Android TV and Google TV you can add toolbar buttons (or hotkeys) for the **Chromecast: Volume Up** and **Chromecast: Volume Down** commands instead. They press the TV's own volume keys, the same way the remote does. The first press pairs MusicBee with the TV: the TV shows a code and MusicBee asks you to type it in. This happens only once.
 
-# Libraries Used
+## Limits
 
-- [GoogleCast](https://github.com/kakone/GoogleCast/tree/master/GoogleCast) + [DayCast](https://github.com/MathieuCyr/DayCast) + [CastIt](https://github.com/Wolfteam/CastIt), with [hig-dev](https://github.com/hig-dev) for his fork 
-- [Nito.AsyncEx](https://www.nuget.org/packages/Nito.AsyncEx)
-- [Microsoft.Owin](https://www.nuget.org/packages/Microsoft.Owin/)
+- The file is streamed as-is, so it has to be in a format the Chromecast can play: MP3, AAC/M4A, FLAC, Ogg/Opus or WAV. WMA, APE and DSD won't play.
+- It uses Google's Default Media Receiver. The TV shows that name with the cover art and track info, and there's no visualizer. Showing "MusicBee" instead needs a receiver app registered with Google; set its ID as `AppId` in `Chromecast.cs`.
+- The Chromecast runs a second or two behind MusicBee, so the last moment of each track can get cut off.
+
+## Troubleshooting
+
+If something doesn't play, `%APPDATA%\MusicBee\Chromecast.log` shows what was sent to the Chromecast, what it answered, and which files it fetched. The log starts over each time MusicBee starts.
+
+Based on the original plugin by [Troy Fernandes](https://github.com/TroyFernandes/MusicBeeChromecast).
